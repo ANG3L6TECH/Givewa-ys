@@ -1,0 +1,136 @@
+// src/database/giveawayRepository.js
+// Persistance SQLite : garantit qu'un redémarrage du bot ne perd aucun giveaway ni participant
+const Database = require('better-sqlite3');
+const fs = require('fs');
+const path = require('path');
+
+const dataDir = path.join(__dirname, '../../data');
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const db = new Database(path.join(dataDir, 'fenkaki.sqlite'));
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS giveaways (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT,
+    host_id TEXT NOT NULL,
+    prize TEXT NOT NULL,
+    winners_count INTEGER NOT NULL DEFAULT 1,
+    ends_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    conditions_json TEXT NOT NULL DEFAULT '[]',
+    participants_json TEXT NOT NULL DEFAULT '[]',
+    disqualified_json TEXT NOT NULL DEFAULT '[]',
+    validated_winners_json TEXT NOT NULL DEFAULT '[]'
+  );
+
+  CREATE TABLE IF NOT EXISTS member_stats (
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    invites_count INTEGER NOT NULL DEFAULT 0,
+    messages_count INTEGER NOT NULL DEFAULT 0,
+    voice_minutes INTEGER NOT NULL DEFAULT 0,
+    custom_flags_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (guild_id, user_id)
+  );
+`);
+
+function deserializeGiveaway(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    conditions: JSON.parse(row.conditions_json || '[]'),
+    participants: JSON.parse(row.participants_json || '[]'),
+    disqualified: JSON.parse(row.disqualified_json || '[]'),
+    validatedWinners: JSON.parse(row.validated_winners_json || '[]')
+  };
+}
+
+module.exports = {
+  createGiveaway(data) {
+    const stmt = db.prepare(`
+      INSERT INTO giveaways (
+        id, guild_id, channel_id, message_id, host_id, prize,
+        winners_count, ends_at, created_at, status,
+        conditions_json, participants_json, disqualified_json, validated_winners_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, '[]', '[]')
+    `);
+    stmt.run(
+      data.id,
+      data.guildId,
+      data.channelId,
+      data.messageId || null,
+      data.hostId,
+      data.prize,
+      data.winnersCount,
+      data.endsAt,
+      Date.now(),
+      JSON.stringify(data.conditions || []),
+      JSON.stringify(data.participants || [])
+    );
+  },
+
+  getActiveGiveaways() {
+    return db
+      .prepare("SELECT * FROM giveaways WHERE status = 'ACTIVE'")
+      .all()
+      .map(deserializeGiveaway);
+  },
+
+  getGiveawayById(id) {
+    const row = db.prepare('SELECT * FROM giveaways WHERE id = ?').get(id);
+    return deserializeGiveaway(row);
+  },
+
+  updateGiveawayState(id, patch) {
+    const current = this.getGiveawayById(id);
+    if (!current) return;
+
+    db.prepare(`
+      UPDATE giveaways
+      SET status = ?,
+          message_id = ?,
+          conditions_json = ?,
+          participants_json = ?,
+          disqualified_json = ?,
+          validated_winners_json = ?
+      WHERE id = ?
+    `).run(
+      patch.status ?? current.status,
+      patch.messageId ?? current.message_id,
+      JSON.stringify(patch.conditions ?? current.conditions),
+      JSON.stringify(patch.participants ?? current.participants),
+      JSON.stringify(patch.disqualified ?? current.disqualified),
+      JSON.stringify(patch.validatedWinners ?? current.validatedWinners),
+      id
+    );
+  },
+
+  incrementMemberMessages(guildId, userId) {
+    db.prepare(`
+      INSERT INTO member_stats (guild_id, user_id, messages_count)
+      VALUES (?, ?, 1)
+      ON CONFLICT(guild_id, user_id)
+      DO UPDATE SET messages_count = messages_count + 1
+    `).run(guildId, userId);
+  },
+
+  getMemberStats(guildId, userId) {
+    const row = db
+      .prepare('SELECT * FROM member_stats WHERE guild_id = ? AND user_id = ?')
+      .get(guildId, userId);
+    if (!row) {
+      return { invites_count: 0, messages_count: 0, voice_minutes: 0, customFlags: {} };
+    }
+    return {
+      ...row,
+      customFlags: JSON.parse(row.custom_flags_json || '{}')
+    };
+  }
+};
